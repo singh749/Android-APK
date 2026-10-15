@@ -68,7 +68,16 @@ jobs:
             buildozer-${{ runner.os }}-
 
       - name: Build debug APK
-        run: buildozer -v android debug
+        run: buildozer -v android debug 2>&1 | tee build.log
+
+      - name: Show the real error (only runs if build failed)
+        if: failure()
+        run: |
+          echo "=============== LINES BEFORE 'Command failed' ==============="
+          n=$(grep -n "# Command failed" build.log | head -1 | cut -d: -f1)
+          if [ -n "$n" ]; then sed -n "$((n>80 ? n-80 : 1)),$((n))p" build.log; fi
+          echo "=============== ERROR LINES ==============="
+          grep -n -i -E "error|failed|not found|cannot|undefined reference" build.log | grep -v "ENVIRONMENT" | tail -40
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
@@ -82,5 +91,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: buildozer-log
-          path: .buildozer/logs/
+          path: build.log
           if-no-files-found: ignore
