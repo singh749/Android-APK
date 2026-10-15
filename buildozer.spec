@@ -8,9 +8,10 @@ source.dir = .
 source.include_exts = py,png,jpg,kv,atlas
 source.exclude_dirs = .github,.git,.buildozer,bin,tests,temp_images,easyocr_models,__pycache__
 
-# LITE build: no EasyOCR / torch / tesseract (they cannot be built for Android
-# and would make the APK 500MB+). OCR runs through Google ML Kit (pyjnius).
-requirements = python3,kivy,numpy,opencv,pyjnius,sqlite3
+# LEAN build: no EasyOCR / torch / tesseract / OpenCV / NumPy. Those either cannot
+# be built for Android or are the most failure-prone recipes. OCR runs through
+# Google ML Kit (pyjnius). The Python code falls back gracefully without cv2.
+requirements = python3,kivy,pyjnius,sqlite3
 
 orientation = portrait
 fullscreen = 0
@@ -25,7 +26,7 @@ android.ndk_api = 24
 android.archs = arm64-v8a
 
 # Pin python-for-android (buildozer's default). Newer NDKs (26+) break its
-# older recipes (opencv, pyjnius, kivy), so NDK is pinned to 25b above.
+# older recipes, so NDK is pinned to 25b above.
 p4a.branch = master
 android.accept_sdk_license = True
 android.enable_androidx = True
