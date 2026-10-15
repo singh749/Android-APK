@@ -23,7 +23,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install test dependencies
-        run: pip install pillow
+        run: pip install pytest pillow
 
       - name: Byte-compile and import the app sources
         run: |
