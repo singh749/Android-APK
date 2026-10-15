@@ -45,7 +45,7 @@ jobs:
           python-version: "3.11"
 
       - name: Set up Java 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
@@ -85,6 +85,16 @@ jobs:
           if [ -n "$n" ]; then sed -n "$((n>80 ? n-80 : 1)),$((n))p" build.log; fi
           echo "=============== ERROR LINES ==============="
           grep -n -i -E "error|failed|not found|cannot|undefined reference" build.log | grep -v "ENVIRONMENT" | tail -40
+
+      - name: Put the error tail in the job summary (failure only)
+        if: failure()
+        run: |
+          {
+            echo '## Last 120 lines of build.log'
+            echo '```'
+            tail -n 120 build.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
