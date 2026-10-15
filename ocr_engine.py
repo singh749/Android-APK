@@ -9,8 +9,18 @@ import os
 import re
 import time
 
-import cv2
-import numpy as np
+# OpenCV/NumPy are OPTIONAL. The Android APK is built without them (they are the
+# most failure-prone recipes in python-for-android); there ML Kit reads the
+# original photo. On a PC with opencv installed, the extra enhanced variants
+# are used as before.
+try:
+    import cv2
+    import numpy as np
+    HAS_CV = True
+except Exception:  # ImportError or a broken native install
+    cv2 = None
+    np = None
+    HAS_CV = False
 
 IS_ANDROID = "ANDROID_ARGUMENT" in os.environ or "ANDROID_PRIVATE" in os.environ
 
@@ -43,7 +53,12 @@ def available_backend():
 
 
 def preprocess_for_engraved(image_path, methods=None):
-    """Return ({name: processed_gray_image}, original_bgr_image)."""
+    """Return ({name: processed_gray_image}, original_bgr_image).
+
+    Without OpenCV, returns ({"original": None}, None): OCR then runs on the
+    unmodified image file."""
+    if not HAS_CV:
+        return {"original": None}, None
     img = cv2.imread(image_path)
     if img is None:
         raise ValueError(f"Failed to load image: {image_path}")
@@ -151,7 +166,25 @@ def _read_mlkit(_img, path):
     BitmapFactory = autoclass("android.graphics.BitmapFactory")
     InputImage = autoclass("com.google.mlkit.vision.common.InputImage")
 
-    bmp = BitmapFactory.decodeFile(path)
+    # Decode at reduced size when the photo is very large (avoids OOM on phones).
+    bmp = None
+    try:
+        Opts = autoclass("android.graphics.BitmapFactory$Options")
+        o = Opts()
+        o.inJustDecodeBounds = True
+        BitmapFactory.decodeFile(path, o)
+        longest = max(int(o.outWidth), int(o.outHeight))
+        sample = 1
+        while longest // sample > 2400:
+            sample *= 2
+        if sample > 1:
+            o2 = Opts()
+            o2.inSampleSize = sample
+            bmp = BitmapFactory.decodeFile(path, o2)
+    except Exception:
+        bmp = None
+    if bmp is None:
+        bmp = BitmapFactory.decodeFile(path)
     if bmp is None:
         return []
     task = _get_mlkit().process(InputImage.fromBitmap(bmp, 0))
@@ -320,10 +353,12 @@ def extract_numbers(image_path):
     for method_name, proc_img in variants.items():
         tmp_file = None
         try:
-            if backend == "mlkit":
+            read_path = image_path  # default: the untouched original file
+            if backend == "mlkit" and HAS_CV and proc_img is not None:
                 tmp_file = os.path.join(tmp_dir, f"_proc_{method_name}.png")
                 cv2.imwrite(tmp_file, proc_img)
-            detections = reader(proc_img, tmp_file)
+                read_path = tmp_file
+            detections = reader(proc_img, read_path)
 
             texts, confs = [], []
             for text, conf_pct in detections:
