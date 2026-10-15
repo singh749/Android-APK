@@ -34,6 +34,8 @@ jobs:
     needs: test
     runs-on: ubuntu-22.04
     timeout-minutes: 120
+    permissions:
+      contents: write   # lets the failure step push the log to a branch
 
     steps:
       - name: Checkout repository
@@ -69,7 +71,7 @@ jobs:
           path: |
             ~/.buildozer
             .buildozer
-          key: buildozer-v3-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          key: buildozer-v4-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
 
       - name: Build debug APK
         shell: bash
@@ -89,12 +91,9 @@ jobs:
       - name: Put the error tail in the job summary (failure only)
         if: failure()
         run: |
-          {
-            echo '## Last 120 lines of build.log'
-            echo '```'
-            tail -n 120 build.log
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          # drop the huge '#     VAR = ...' environment dump so the real error shows
+          grep -v '^#     ' build.log | tail -n 150 > /tmp/tail.log
+          { echo '## Last 150 lines of build.log (env dump removed)'; echo '```'; cat /tmp/tail.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
@@ -110,3 +109,16 @@ jobs:
           name: buildozer-log
           path: build.log
           if-no-files-found: ignore
+
+      - name: Push filtered log to 'build-logs' branch (failure only)
+        if: failure()
+        run: |
+          grep -v '^#     ' build.log | tail -n 400 > /tmp/build-tail.log
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git checkout --orphan build-logs
+          git rm -rf . -q
+          cp /tmp/build-tail.log build-tail.log
+          git add build-tail.log
+          git commit -qm "build log tail"
+          git push -f origin build-logs
