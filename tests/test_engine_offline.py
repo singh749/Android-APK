@@ -77,5 +77,10 @@ def main():
     print("\nALL OFFLINE CHECKS PASSED")
 
 
+def test_offline_pipeline():
+    """pytest entry point - same checks as running this file directly."""
+    main()
+
+
 if __name__ == "__main__":
     main()
