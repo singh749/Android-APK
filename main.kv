@@ -83,6 +83,15 @@
                 bold: True
                 on_press: app.run_ocr()
 
+        # Status line (what the app is doing right now)
+        Label:
+            id: status_label
+            text: "Select or capture an image to begin"
+            size_hint_y: None
+            height: dp(22)
+            font_size: sp(12)
+            color: 0.55, 0.6, 0.72, 1
+
         # Results Panel
         BoxLayout:
             size_hint_y: 0.35

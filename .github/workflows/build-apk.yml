@@ -2,7 +2,7 @@ name: Build Android APK
 
 on:
   push:
-    branches: [ "main", "master" ]
+    branches: [ "main", "master", "arena/**" ]
   pull_request:
     branches: [ "main", "master" ]
   workflow_dispatch:
@@ -23,7 +23,17 @@ jobs:
           python-version: "3.11"
 
       - name: Install test dependencies
-        run: pip install numpy opencv-python-headless pytest
+        run: pip install pillow
+
+      - name: Byte-compile and import the app sources
+        run: |
+          python -m py_compile main.py ocr_engine.py database.py
+          python - <<'PY'
+          import ocr_engine, database
+          print("ocr_engine backend on this box:", ocr_engine.available_backend())
+          print("cv2:", ocr_engine.HAVE_CV2, "| pillow:", ocr_engine.HAVE_PIL)
+          print("database module OK")
+          PY
 
       - name: Run tests (skipped if no tests folder)
         run: |
@@ -55,20 +65,66 @@ jobs:
       - name: Install Buildozer
         run: |
           python -m pip install --upgrade pip
-          pip install --upgrade buildozer "cython<3.1" virtualenv setuptools
+          pip install --upgrade buildozer "cython<3.0" virtualenv setuptools
 
-      - name: Cache Buildozer (SDK, NDK, compiled recipes)
+      # The SDK/NDK live in ~/.buildozer (several GB, cheap to re-download),
+      # so only the project dir with the compiled recipes is cached.
+      - name: Cache Buildozer project dir (recipe sources and builds)
         uses: actions/cache@v4
         with:
-          path: |
-            ~/.buildozer
-            .buildozer
-          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          path: .buildozer
+          key: buildozer-project-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
           restore-keys: |
-            buildozer-${{ runner.os }}-
+            buildozer-project-${{ runner.os }}-
 
       - name: Build debug APK
-        run: buildozer -v android debug
+        run: buildozer -v android debug 2>&1 | tee build.log
+
+      - name: Show the real error (only runs if the build failed)
+        if: failure()
+        run: |
+          echo "=============== LAST 80 LINES ==============="
+          tail -n 80 build.log || true
+          n=$(grep -n "# Command failed" build.log | head -1 | cut -d: -f1)
+          if [ -n "$n" ]; then
+            echo "=============== 60 LINES BEFORE 'Command failed' ==============="
+            sed -n "$((n>60 ? n-60 : 1)),${n}p" build.log
+          fi
+          echo "=============== ERROR LINES ==============="
+          grep -n -i -E "error:|ERROR |Traceback|No such file|not found|failed" build.log \
+            | grep -v "ENVIRONMENT" | tail -40 || true
+          echo "=============== ANNOTATION ==============="
+          msg=$(grep -i -E "error:|ERROR |Traceback|No such file" build.log \
+                  | grep -v "ENVIRONMENT" | tail -3 \
+                  | sed -e 's/%/%25/g' -e 's/\r//g' | tr '\n' '|' | cut -c1-900)
+          if [ -n "$msg" ]; then
+            echo "::error title=Buildozer failure::${msg}"
+          else
+            echo "::error title=Buildozer failure::build failed, see the build.log artifact"
+          fi
+
+      - name: Verify the APK contents
+        if: success()
+        run: |
+          set -e
+          APK=$(ls bin/*.apk | head -1)
+          echo "APK: $APK"
+          ls -lh "$APK"
+          BT_DIR=$(ls -d "$HOME"/.buildozer/android/platform/android-sdk/build-tools/* 2>/dev/null | sort -V | tail -1)
+          if [ -n "$BT_DIR" ] && [ -x "$BT_DIR/aapt2" ]; then
+            echo "=============== badging ==============="
+            "$BT_DIR/aapt2" dump badging "$APK" | head -20 || true
+            echo "=============== permissions ==============="
+            "$BT_DIR/aapt2" dump permissions "$APK" || true
+            echo "=============== native code ==============="
+            "$BT_DIR/aapt2" dump badging "$APK" | grep -E "native-code|sdkVersion|targetSdkVersion|package:" || true
+          fi
+          echo "=============== native libraries ==============="
+          unzip -l "$APK" | grep -E "lib/.*\.so" || echo "(none)"
+          echo "=============== ML Kit assets ==============="
+          unzip -l "$APK" | grep -iE "mlkit|tflite|\.model|model_" | head -20 || true
+          echo "=============== python bundle ==============="
+          unzip -l "$APK" | grep -E "assets/|classes.*dex" | head -20 || true
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
@@ -82,5 +138,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: buildozer-log
-          path: .buildozer/logs/
+          path: build.log
           if-no-files-found: ignore

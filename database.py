@@ -35,7 +35,14 @@ def _row_to_dict(r):
 
 
 def init_database():
-    """Create the schema if it does not exist."""
+    """Create the schema if it does not exist (never fatal for the app)."""
+    try:
+        _init_database()
+    except Exception as e:  # a read-only or full storage must not kill the app
+        print(f"[DB] Could not prepare the database: {e}")
+
+
+def _init_database():
     with closing(_connect()) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS ocr_history (

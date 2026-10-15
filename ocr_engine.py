@@ -1,16 +1,23 @@
 """OCR engine for engraved / stamped metal serial numbers.
 
-Backends (picked automatically, override with env var OCR_BACKEND):
-  * mlkit     - Google ML Kit via pyjnius. Used on Android (LITE build, ~no extra size)
-  * easyocr   - best accuracy on desktop, needs torch (NOT usable in the APK)
-  * tesseract - optional desktop fallback (pytesseract + tesseract binary)
+Backends (picked automatically, override with the OCR_BACKEND env var):
+
+  * mlkit     - Google ML Kit text recognition, driven from Python with
+                pyjnius.  This is what the Android APK uses: the Latin model is
+                bundled inside the app, so it works offline and needs no extra
+                downloads.  Image enhancement is done with Pillow, because the
+                APK deliberately ships without numpy/OpenCV (they can not be
+                cross-compiled for Android with the supported NDK).
+  * easyocr   - best accuracy on desktop, needs torch (NOT usable in the APK).
+  * tesseract - optional desktop fallback (pytesseract + the tesseract binary).
+
+The public entry point is :func:`extract_numbers`, which returns a dict with
+``best_text``, ``cleaned``, ``confidence``, ``method``, ``engine``,
+``alternatives`` and ``all_results``.
 """
 import os
 import re
 import time
-
-import cv2
-import numpy as np
 
 IS_ANDROID = "ANDROID_ARGUMENT" in os.environ or "ANDROID_PRIVATE" in os.environ
 
@@ -22,6 +29,26 @@ MAX_SIDE = 1280 if IS_ANDROID else 2000
 # Lite mode: fewer preprocessing variants = much faster on a phone.
 LITE_METHODS = ("clahe_strong", "clahe_sharp", "illum_norm", "gray")
 
+# --- optional third party image libraries -----------------------------------
+try:  # desktop only: not part of the Android APK
+    import cv2
+    import numpy as np
+except Exception:  # pragma: no cover - depends on the platform
+    cv2 = None
+    np = None
+
+try:  # the Android APK uses Pillow for image enhancement
+    from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+except Exception:  # pragma: no cover - depends on the platform
+    Image = None
+
+HAVE_CV2 = cv2 is not None and np is not None
+HAVE_PIL = Image is not None
+
+
+# =====================================================
+# BACKEND SELECTION
+# =====================================================
 
 def available_backend():
     """Return the name of the backend that will be used, or None."""
@@ -42,8 +69,14 @@ def available_backend():
         return None
 
 
+# =====================================================
+# PREPROCESSING - desktop (OpenCV/numpy)
+# =====================================================
+
 def preprocess_for_engraved(image_path, methods=None):
-    """Return ({name: processed_gray_image}, original_bgr_image)."""
+    """Return ({name: processed_gray_image}, original_bgr_image) - desktop."""
+    if not HAVE_CV2:
+        raise RuntimeError("OpenCV is not installed on this machine")
     img = cv2.imread(image_path)
     if img is None:
         raise ValueError(f"Failed to load image: {image_path}")
@@ -51,7 +84,8 @@ def preprocess_for_engraved(image_path, methods=None):
     h, w = img.shape[:2]
     scale = MAX_SIDE / float(max(h, w))
     if scale < 1.0:
-        img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+        img = cv2.resize(img, (int(w * scale), int(h * scale)),
+                         interpolation=cv2.INTER_AREA)
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     results = {}
@@ -66,25 +100,94 @@ def preprocess_for_engraved(image_path, methods=None):
     results["clahe_fine"] = clahe2.apply(gray)
 
     for name, g in (("gamma_deep", 2.0), ("gamma_mild", 1.5)):
-        table = np.array([((i / 255.0) ** (1.0 / g)) * 255 for i in range(256)], dtype=np.uint8)
+        table = np.array([((i / 255.0) ** (1.0 / g)) * 255
+                          for i in range(256)], dtype=np.uint8)
         results[name] = cv2.LUT(gray, table)
 
     blur = cv2.GaussianBlur(gray, (25, 25), 0)
     ratio = gray.astype(np.float32) / (blur.astype(np.float32) + 1.0)
-    results["illum_norm"] = cv2.normalize(ratio, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    results["illum_norm"] = cv2.normalize(
+        ratio, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
     ci = results["clahe_strong"]
-    results["clahe_sharp"] = cv2.addWeighted(ci, 1.8, cv2.GaussianBlur(ci, (0, 0), 2.0), -0.8, 0)
+    results["clahe_sharp"] = cv2.addWeighted(
+        ci, 1.8, cv2.GaussianBlur(ci, (0, 0), 2.0), -0.8, 0)
 
     bilat = cv2.bilateralFilter(gray, 7, 50, 50)
-    results["bilat_sharp"] = cv2.addWeighted(bilat, 2.2, cv2.GaussianBlur(bilat, (0, 0), 2.5), -1.2, 0)
+    results["bilat_sharp"] = cv2.addWeighted(
+        bilat, 2.2, cv2.GaussianBlur(bilat, (0, 0), 2.5), -1.2, 0)
 
-    results["unsharp_mask"] = cv2.addWeighted(gray, 2.0, cv2.GaussianBlur(gray, (0, 0), 2.0), -1.0, 0)
+    results["unsharp_mask"] = cv2.addWeighted(
+        gray, 2.0, cv2.GaussianBlur(gray, (0, 0), 2.0), -1.0, 0)
     results["gray"] = gray
 
     if methods:
         results = {k: v for k, v in results.items() if k in methods}
     return results, img
+
+
+# =====================================================
+# PREPROCESSING - Android (Pillow, no numpy/OpenCV)
+# =====================================================
+
+def load_pillow_image(image_path):
+    """Open an image file, honour its EXIF rotation, and cap its size."""
+    img = Image.open(image_path)
+    img.load()
+    try:  # camera photos are often stored rotated
+        img = ImageOps.exif_transpose(img)
+    except Exception:
+        pass
+    img = img.convert("RGB")
+    w, h = img.size
+    scale = MAX_SIDE / float(max(w, h))
+    if scale < 1.0:
+        img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))),
+                         Image.LANCZOS)
+    return img
+
+
+def _center_crop(img, frac=0.62):
+    w, h = img.size
+    cw, ch = max(1, int(w * frac)), max(1, int(h * frac))
+    left, top = (w - cw) // 2, (h - ch) // 2
+    return img.crop((left, top, left + cw, top + ch))
+
+
+def preprocess_pillow(image_path, methods=None):
+    """Return {name: PIL image} - used by the Android/ML Kit pipeline.
+
+    Engraved metal numbers are usually low contrast, small and slightly
+    blurred, so the variants mix global contrast, sharpening, upscaling,
+    inversion and thresholding to give ML Kit several fair chances.
+    """
+    if not HAVE_PIL:
+        raise RuntimeError("Pillow is not installed on this machine")
+
+    rgb = load_pillow_image(image_path)
+    gray = rgb.convert("L")
+
+    base = ImageOps.autocontrast(gray, cutoff=1)
+    sharp = base.filter(ImageFilter.UnsharpMask(radius=2, percent=170,
+                                                threshold=3))
+    big = _center_crop(sharp, 0.62)
+    big = big.resize((big.width * 2, big.height * 2), Image.LANCZOS)
+    big = big.filter(ImageFilter.UnsharpMask(radius=3, percent=190,
+                                             threshold=3))
+
+    results = {
+        "gray": gray,
+        "contrast": base,
+        "sharp": sharp,
+        "crop_2x": big,
+        "equalized": ImageOps.equalize(sharp),
+        "inverted": ImageOps.invert(sharp),
+        "binary": big.point(lambda p: 255 if p > 110 else 0),
+    }
+
+    if methods:
+        results = {k: v for k, v in results.items() if k in methods}
+    return results
 
 
 # =====================================================
@@ -101,9 +204,11 @@ def _get_easy_reader():
         import easyocr
         try:
             from kivy.app import App
-            model_dir = os.path.join(App.get_running_app().user_data_dir, "easyocr_models")
+            model_dir = os.path.join(App.get_running_app().user_data_dir,
+                                     "easyocr_models")
         except Exception:
-            model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "easyocr_models")
+            model_dir = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "easyocr_models")
         os.makedirs(model_dir, exist_ok=True)
         print("[OCR] Loading EasyOCR reader...")
         _easy_reader = easyocr.Reader(["en"], gpu=False, verbose=False,
@@ -123,7 +228,8 @@ def _read_easyocr(img, _path):
 def _read_tesseract(img, _path):
     import pytesseract
     cfg = f"--psm 6 -c tessedit_char_whitelist={ALLOWLIST}"
-    data = pytesseract.image_to_data(img, config=cfg, output_type=pytesseract.Output.DICT)
+    data = pytesseract.image_to_data(img, config=cfg,
+                                     output_type=pytesseract.Output.DICT)
     out = []
     for txt, conf in zip(data["text"], data["conf"]):
         try:
@@ -135,7 +241,12 @@ def _read_tesseract(img, _path):
     return out
 
 
+# ---------------------------------------------------------------
+# Android: ML Kit (bundled Latin model, works offline)
+# ---------------------------------------------------------------
+
 def _get_mlkit():
+    """Create (once) the ML Kit text recognizer."""
     global _mlkit_client
     if _mlkit_client is None:
         from jnius import autoclass
@@ -146,23 +257,32 @@ def _get_mlkit():
 
 
 def _read_mlkit(_img, path):
-    """Runs ML Kit on an image FILE. Must be called from a worker thread."""
-    from jnius import autoclass
-    BitmapFactory = autoclass("android.graphics.BitmapFactory")
-    InputImage = autoclass("com.google.mlkit.vision.common.InputImage")
+    """Run ML Kit on an image *file*.
 
-    bmp = BitmapFactory.decodeFile(path)
-    if bmp is None:
-        return []
-    task = _get_mlkit().process(InputImage.fromBitmap(bmp, 0))
+    ``path`` is either the original picture (EXIF rotation is applied for us by
+    ``InputImage.fromFilePath``) or one of the Pillow enhanced variants.
+    Must be called from a worker thread - the caller does that.
+    """
+    from jnius import autoclass, cast
+    Uri = autoclass("android.net.Uri")
+    File = autoclass("java.io.File")
+    InputImage = autoclass("com.google.mlkit.vision.common.InputImage")
+    PythonActivity = autoclass("org.kivy.android.PythonActivity")
+
+    activity = PythonActivity.mActivity
+    uri = Uri.fromFile(File(os.path.abspath(path)))
+    image = InputImage.fromFilePath(activity, uri)
+    task = _get_mlkit().process(image)
 
     deadline = time.time() + 30
     while not task.isComplete():
         if time.time() > deadline:
             raise TimeoutError("ML Kit timed out")
         time.sleep(0.02)
+
     if not task.isSuccessful():
-        raise RuntimeError("ML Kit failed: %s" % task.getException())
+        exception = task.getException()
+        raise RuntimeError("ML Kit failed: %s" % exception)
 
     text = task.getResult()
     out = []
@@ -172,14 +292,20 @@ def _read_mlkit(_img, path):
         for j in range(lines.size()):
             line = lines.get(j)
             try:
-                conf = float(line.getConfidence()) * 100.0
+                raw_conf = line.getConfidence()
+                # getConfidence() is nullable in ML Kit's Text.Line API
+                conf = float(raw_conf) * 100.0 if raw_conf is not None else 70.0
             except Exception:
                 conf = 70.0  # confidence not provided by this ML Kit version
             out.append((str(line.getText()), conf))
     return out
 
 
-_READERS = {"easyocr": _read_easyocr, "tesseract": _read_tesseract, "mlkit": _read_mlkit}
+_READERS = {
+    "easyocr": _read_easyocr,
+    "tesseract": _read_tesseract,
+    "mlkit": _read_mlkit,
+}
 
 
 # =====================================================
@@ -291,39 +417,62 @@ def score_candidate(cand_str):
 # MAIN OCR EXTRACTION
 # =====================================================
 
-def extract_numbers(image_path):
-    """Run all preprocessing variants through the OCR backend and rank results.
+def _rank_results(all_candidates, summary, engine, result):
+    """Shared ranking/normalisation step for every backend."""
+    result["all_results"] = summary
 
-    Returns dict: best_text, cleaned, confidence, method, engine,
-                  alternatives, all_results
-    """
-    print(f"\n[OCR] Processing: {os.path.basename(image_path)}")
+    if not all_candidates:
+        print("[OCR] No serial number detected")
+        return result
 
+    all_candidates.sort(key=lambda x: x["score"], reverse=True)
+    best = all_candidates[0]
+    print(f"\n[OCR] Raw Top Candidate: '{best['clean']}' "
+          f"({best['conf']:.1f}%) via [{best['method']}]")
+
+    normalized = []
+    for cand in all_candidates[:5]:
+        normalized.extend(normalize_metal_serial(cand["clean"]))
+
+    unique = list(dict.fromkeys(normalized))
+    unique.sort(key=lambda x: (score_candidate(x), len(x)), reverse=True)
+    primary = unique[0] if unique else best["clean"]
+
+    result.update({
+        "best_text": primary, "cleaned": primary,
+        "confidence": round(best["conf"], 1), "method": best["method"],
+        "engine": engine, "alternatives": unique[:5],
+    })
+    print(f"[OCR] FINAL PREDICTION: '{primary}'")
+    print(f"[OCR] ALTERNATIVES: {result['alternatives']}")
+    return result
+
+
+def _extract_with_mlkit(image_path):
+    """Android pipeline: Pillow enhancement variants -> ML Kit."""
     result = {
         "best_text": "", "cleaned": "", "confidence": 0.0,
-        "method": "", "engine": "", "alternatives": [], "all_results": {},
+        "method": "", "engine": "mlkit", "alternatives": [], "all_results": {},
     }
 
-    backend = available_backend()
-    if backend is None:
-        raise RuntimeError("No OCR backend available (install easyocr or pytesseract)")
-    result["engine"] = backend
-    reader = _READERS[backend]
-
-    lite = backend == "mlkit"
-    variants, _ = preprocess_for_engraved(image_path, LITE_METHODS if lite else None)
-
+    variants = preprocess_pillow(image_path)
+    tmp_dir = os.path.dirname(os.path.abspath(image_path))
+    # First pass on the untouched photo (ML Kit applies its EXIF rotation),
+    # then on every enhanced variant.
+    jobs = [("original", None)] + list(variants.items())
     all_candidates = []
     summary = {}
-    tmp_dir = os.path.dirname(os.path.abspath(image_path))
 
-    for method_name, proc_img in variants.items():
+    for method_name, img in jobs:
         tmp_file = None
         try:
-            if backend == "mlkit":
-                tmp_file = os.path.join(tmp_dir, f"_proc_{method_name}.png")
-                cv2.imwrite(tmp_file, proc_img)
-            detections = reader(proc_img, tmp_file)
+            if img is None:
+                read_path = image_path
+            else:
+                tmp_file = os.path.join(tmp_dir, f"_proc_{method_name}.jpg")
+                img.save(tmp_file, format="JPEG", quality=92)
+                read_path = tmp_file
+            detections = _read_mlkit(img, read_path)
 
             texts, confs = [], []
             for text, conf_pct in detections:
@@ -347,35 +496,74 @@ def extract_numbers(image_path):
             print(f"  [{method_name}]: Error - {e}")
             summary[method_name] = {"text": "", "confidence": 0.0}
         finally:
-            if tmp_file and os.path.exists(tmp_file):
-                try:
+            try:
+                if tmp_file and os.path.exists(tmp_file):
                     os.remove(tmp_file)
-                except OSError:
-                    pass
+            except OSError:
+                pass
 
-    result["all_results"] = summary
+    return _rank_results(all_candidates, summary, "mlkit", result)
 
-    if not all_candidates:
-        print("[OCR] No serial number detected")
-        return result
 
-    all_candidates.sort(key=lambda x: x["score"], reverse=True)
-    best = all_candidates[0]
-    print(f"\n[OCR] Raw Top Candidate: '{best['clean']}' ({best['conf']:.1f}%) via [{best['method']}]")
+def _extract_desktop(image_path, backend):
+    """Desktop pipeline: OpenCV variants (EasyOCR/tesseract)."""
+    result = {
+        "best_text": "", "cleaned": "", "confidence": 0.0,
+        "method": "", "engine": backend, "alternatives": [], "all_results": {},
+    }
+    reader = _READERS[backend]
 
-    normalized = []
-    for cand in all_candidates[:5]:
-        normalized.extend(normalize_metal_serial(cand["clean"]))
+    if HAVE_CV2:
+        variants, _ = preprocess_for_engraved(image_path)
+    else:
+        # Pillow is enough on a machine without OpenCV
+        variants = preprocess_pillow(image_path)
 
-    unique = list(dict.fromkeys(normalized))
-    unique.sort(key=lambda x: (score_candidate(x), len(x)), reverse=True)
-    primary = unique[0] if unique else best["clean"]
+    all_candidates = []
+    summary = {}
 
-    result.update({
-        "best_text": primary, "cleaned": primary,
-        "confidence": round(best["conf"], 1), "method": best["method"],
-        "alternatives": unique[:5],
-    })
-    print(f"[OCR] FINAL PREDICTION: '{primary}'")
-    print(f"[OCR] ALTERNATIVES: {result['alternatives']}")
-    return result
+    for method_name, proc_img in variants.items():
+        try:
+            detections = reader(proc_img, image_path)
+            texts, confs = [], []
+            for text, conf_pct in detections:
+                clean = re.sub(r"[^A-Z0-9]", "", text.upper())
+                if not clean:
+                    continue
+                texts.append(clean)
+                confs.append(conf_pct)
+                bonus = len(clean) * (25 if len(clean) >= 5 else 8)
+                all_candidates.append({
+                    "clean": clean, "raw": text, "conf": conf_pct,
+                    "score": bonus + conf_pct, "method": method_name,
+                })
+
+            joined = " ".join(texts)
+            avg = (sum(confs) / len(confs)) if confs else 0.0
+            summary[method_name] = {"text": joined, "confidence": round(avg, 1)}
+            if joined:
+                print(f"  [{method_name}]: '{joined}' ({avg:.1f}%)")
+        except Exception as e:
+            print(f"  [{method_name}]: Error - {e}")
+            summary[method_name] = {"text": "", "confidence": 0.0}
+
+    return _rank_results(all_candidates, summary, backend, result)
+
+
+def extract_numbers(image_path):
+    """Run every preprocessing variant through the OCR backend and rank results.
+
+    Returns dict: best_text, cleaned, confidence, method, engine,
+                  alternatives, all_results
+    """
+    print(f"\n[OCR] Processing: {os.path.basename(image_path)}")
+
+    backend = available_backend()
+    if backend is None:
+        raise RuntimeError(
+            "No OCR backend available (the APK uses ML Kit, on desktop install "
+            "easyocr or tesseract)")
+
+    if backend == "mlkit":
+        return _extract_with_mlkit(image_path)
+    return _extract_desktop(image_path, backend)
