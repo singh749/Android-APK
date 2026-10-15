@@ -10,7 +10,7 @@ source.exclude_dirs = .github,.git,.buildozer,bin,tests,temp_images,easyocr_mode
 
 # LITE build: no EasyOCR / torch / tesseract (they cannot be built for Android
 # and would make the APK 500MB+). OCR runs through Google ML Kit (pyjnius).
-requirements = python3,kivy==2.3.0,numpy,opencv,pyjnius,sqlite3
+requirements = python3,kivy,numpy,opencv,pyjnius,sqlite3
 
 orientation = portrait
 fullscreen = 0
