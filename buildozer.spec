@@ -19,10 +19,14 @@ fullscreen = 0
 android.permissions = CAMERA,READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE,READ_MEDIA_IMAGES
 android.api = 33
 android.minapi = 24
-android.ndk = 28c
+android.ndk = 25b
 android.ndk_api = 24
 # One architecture = half the size and build time (nearly all modern phones are arm64)
 android.archs = arm64-v8a
+
+# Pin python-for-android (buildozer's default). Newer NDKs (26+) break its
+# older recipes (opencv, pyjnius, kivy), so NDK is pinned to 25b above.
+p4a.branch = master
 android.accept_sdk_license = True
 android.enable_androidx = True
 
