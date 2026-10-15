@@ -68,7 +68,10 @@ jobs:
             buildozer-${{ runner.os }}-
 
       - name: Build debug APK
-        run: buildozer -v android debug 2>&1 | tee build.log
+        shell: bash
+        run: |
+          set -o pipefail
+          buildozer -v android debug 2>&1 | tee build.log
 
       - name: Show the real error (only runs if build failed)
         if: failure()
