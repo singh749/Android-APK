@@ -1,0 +1,5 @@
+# Desktop LITE install (no torch/EasyOCR, ~tiny). Needs the tesseract binary installed.
+Kivy==2.3.0
+opencv-python-headless>=4.8.0
+numpy>=1.24.0
+pytesseract>=0.3.10

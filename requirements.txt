@@ -1,0 +1,6 @@
+# Desktop / PC testing (FULL version, best accuracy).
+# The Android APK does NOT use this file - see buildozer.spec (lite, ML Kit).
+Kivy==2.3.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+easyocr>=1.7.0
